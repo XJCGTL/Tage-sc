@@ -152,7 +152,15 @@ static void build_gadget(uint8_t *page_base)
     code[2] = RV_RET;
     code[3] = rv_itype(0, RV_A0, RV_ZERO, 0, 0x13); /* addi a0, x0, 0 */
     code[4] = RV_RET;
-    __builtin___clear_cache((char *)code, (char *)(code + 5));
+    /* fence.i synchronises the I-cache with the D-cache on the local hart,
+     * ensuring the newly written instructions are visible to the CPU before
+     * the gadget is called.  __builtin___clear_cache is avoided here because
+     * it emits a call to __riscv_flush_icache which is not always available
+     * at link time (e.g. when linking against a bare-metal or minimal sysroot
+     * that does not expose the vDSO helper).  For this single-threaded PoC
+     * the local fence is sufficient; use the riscv_flush_icache(2) syscall
+     * if cross-hart coherence is ever required. */
+    __asm__ volatile ("fence.i" ::: "memory");
 }
 
 #endif /* __riscv */
