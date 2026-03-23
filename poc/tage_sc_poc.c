@@ -72,7 +72,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <sys/mman.h>
 #include <time.h>
 #include <assert.h>
 
@@ -459,16 +458,12 @@ int main(void)
     uint64_t pc_a, pc_b;
     gadget_fn trainer_fn, victim_fn;
 
-    /* Region used only on RISC-V; set to MAP_FAILED sentinel otherwise. */
-    void *region = MAP_FAILED;
-
 #if defined(__riscv)
-    size_t region_size = (size_t)4096 * 4;
-    region = mmap(NULL, region_size,
-                  PROT_READ | PROT_WRITE | PROT_EXEC,
-                  MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (region == MAP_FAILED) { perror("mmap"); return 1; }
-    memset(region, 0, region_size);
+    /* Static buffer used as executable memory for the two branch gadgets.
+     * In the AM bare-metal environment there is no W^X protection, so the
+     * CPU can fetch and execute instructions placed in this buffer. */
+    static uint8_t region[4096 * 4];
+    memset(region, 0, sizeof(region));
 
     uint8_t *page_trainer = (uint8_t *)region;
     uint8_t *page_victim  = (uint8_t *)region + 4096;
@@ -519,11 +514,8 @@ int main(void)
     uint64_t fixed_history = 0xAB;
     bool collides = verify_collision(pc_a, pc_b, fixed_history);
     if (!collides) {
-        fprintf(stderr,
-                "\n[BUG] Unexpected: simulation shows no collision for same-page-offset PCs.\n"
-                "      Check TAGE_IDX_BITS and fold_history() implementation.\n");
-        if (region != MAP_FAILED)
-            munmap(region, (size_t)4096 * 4);
+        printf("\n[BUG] Unexpected: simulation shows no collision for same-page-offset PCs.\n"
+               "      Check TAGE_IDX_BITS and fold_history() implementation.\n");
         return 1;
     }
 
@@ -552,7 +544,5 @@ int main(void)
      * ------------------------------------------------------------------ */
     print_mitigations();
 
-    if (region != MAP_FAILED)
-        munmap(region, (size_t)4096 * 4);
     return 0;
 }
