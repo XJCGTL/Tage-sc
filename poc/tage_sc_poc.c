@@ -72,8 +72,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <time.h>
-#include <assert.h>
+//#include <time.h>
+//#include <assert.h>
+#include <am.h>
+#include <klib.h>
 
 #include "tage_model.h"
 
@@ -175,13 +177,13 @@ static void build_gadget(uint8_t *page_base)
  * penalty instead.
  * ===================================================================== */
 
-static __attribute__((noinline)) int native_trainer(int cond)
+static __attribute__((unused)) int native_trainer(int cond)
 {
     if (cond) return 1;
     return 0;
 }
 
-static __attribute__((noinline)) int native_victim(int cond)
+static __attribute__((unused)) int native_victim(int cond)
 {
     if (cond) return 1;
     return 0;
