@@ -283,13 +283,13 @@ static inline uint64_t read_cycles(void)
 }
 
 /*
- * Execute a history primer: 64 always-taken conditional branches.
+ * Execute a history primer: 16 always-taken conditional branches.
  *
- * 64 branches set the lower 64 bits of the global history register,
- * covering all four TAGE tables (T1: 8-bit, T2: 13-bit, T3: 32-bit,
- * T4: 119-bit partially).  Using 64 instead of 16 branches improves
- * aliasing reliability for T3 (32-bit history) which was unreliable with
- * the previous 16-branch primer.
+ * 16 branches set the lower 16 bits of the global history register,
+ * fully covering T1 (8-bit history) and T2 (13-bit history).  This is
+ * sufficient for the aliasing demonstration on bare-metal / emulated
+ * environments where minimising iteration count is important for
+ * keeping total runtime manageable.
  *
  * The volatile prevents the compiler from hoisting or eliminating the
  * branches; we deliberately omit __builtin_expect so the real hardware
@@ -298,20 +298,8 @@ static inline uint64_t read_cycles(void)
 static __attribute__((noinline)) void prime_history(void)
 {
     volatile int one = 1;
-    /* 64 always-taken branches — covers T1/T2/T3 history lengths fully
-     * and partially covers T4 (119-bit). */
-    if (one) {} if (one) {} if (one) {} if (one) {}
-    if (one) {} if (one) {} if (one) {} if (one) {}
-    if (one) {} if (one) {} if (one) {} if (one) {}
-    if (one) {} if (one) {} if (one) {} if (one) {}
-    if (one) {} if (one) {} if (one) {} if (one) {}
-    if (one) {} if (one) {} if (one) {} if (one) {}
-    if (one) {} if (one) {} if (one) {} if (one) {}
-    if (one) {} if (one) {} if (one) {} if (one) {}
-    if (one) {} if (one) {} if (one) {} if (one) {}
-    if (one) {} if (one) {} if (one) {} if (one) {}
-    if (one) {} if (one) {} if (one) {} if (one) {}
-    if (one) {} if (one) {} if (one) {} if (one) {}
+    /* 16 always-taken branches — covers T1 (8-bit) and T2 (13-bit)
+     * history lengths fully. */
     if (one) {} if (one) {} if (one) {} if (one) {}
     if (one) {} if (one) {} if (one) {} if (one) {}
     if (one) {} if (one) {} if (one) {} if (one) {}
@@ -322,21 +310,22 @@ static __attribute__((noinline)) void prime_history(void)
  * Training repetitions per trial, total trial count, and warmup depth.
  *
  * TRAIN_ITERS  - branches executed as TAKEN per trial to saturate the
- *                3-bit TAGE counter (max = +3) with high confidence.
- *                Raised from 500 → 2 000 to improve T3/T4 coverage.
+ *                3-bit TAGE counter (max = +3).  The counter starts near
+ *                0 and needs only 3-4 increments to reach strong-taken;
+ *                20 iterations is more than sufficient.
  *
  * TRIAL_COUNT  - independent train→measure trials for both the baseline
- *                and attack phases.  More trials expose the misprediction
- *                rate distribution better than a single aggregate average.
+ *                and attack phases.  30 trials provide enough samples to
+ *                expose the misprediction rate distribution.
  *
  * WARMUP_ITERS - NOT-TAKEN victim calls before Phase 0 measurement.
  *                Without this the predictor has no entry at all, so the
  *                baseline Phase 0 exhibits cold-miss latency identical to
  *                a misprediction — making both phases look the same.
  */
-#define TRAIN_ITERS   2000
-#define TRIAL_COUNT    200
-#define WARMUP_ITERS  2000
+#define TRAIN_ITERS     20
+#define TRIAL_COUNT     30
+#define WARMUP_ITERS   100
 
 /*
  * Warm up the victim branch by calling it NOT-TAKEN `iters` times so
